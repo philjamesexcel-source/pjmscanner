@@ -1,0 +1,281 @@
+# ============================================================
+#  MEMECOIN SCREENER — k3s DEPLOYMENT
+#  Two strategies: A (Fast) + B (Swing)
+#  Two containers: screener + dashboard
+#  NO code ConfigMap mounts — all Python baked into image
+#  ONLY config.yaml mounted via ConfigMap
+#
+#  Before applying:
+#    1. Fill REPLACE_WITH_* in screener-secrets
+#    2. Apply postgres.yaml first
+#    3. kubectl apply -f k8s.yaml
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: screener
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: screener-secrets
+  namespace: screener
+type: Opaque
+stringData:
+  TELEGRAM_BOT_TOKEN:  "REPLACE_WITH_YOUR_BOT_TOKEN"
+  TELEGRAM_CHANNEL_ID: "REPLACE_WITH_YOUR_CHANNEL_ID"
+  HELIUS_RPC_URL:      "https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_YOUR_KEY"
+  POSTGRES_HOST:       "postgres.screener.svc.cluster.local"
+  POSTGRES_PORT:       "5432"
+  POSTGRES_DB:         "screener"
+  POSTGRES_USER:       "screener"
+  POSTGRES_PASSWORD:   "REPLACE_WITH_STRONG_PASSWORD"
+
+---
+# config.yaml — the ONLY ConfigMap mount.
+# Edit thresholds here and restart the pod — no rebuild needed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: screener-config
+  namespace: screener
+data:
+  config.yaml: |
+    scan_interval_minutes: 15
+
+    strategy_a:
+      enabled: true
+      label: "⚡ FAST"
+      age:
+        min_minutes: 5
+        max_hours: 24
+      market_cap:
+        min: 30000
+        max: 3000000
+      liquidity:
+        min: 15000
+        max: 500000
+        liq_to_mc_min_pct: 5
+        liq_to_mc_max_pct: 50
+      volume:
+        min_24h: 50000
+        min_1h: 5000
+        min_5m: 500
+        vol_liq_min_ratio: 1.0
+        vol_liq_hard_reject: 30.0
+      price_change:
+        min_1h_pct: -20
+        min_24h_pct: 20
+        max_24h_pct: 10000
+      buy_sell:
+        min_buy_ratio_1h: 0.52
+        min_tx_count_1h: 15
+      security:
+        require_mint_renounced: true
+        require_freeze_renounced: true
+        allow_mutable_metadata: true
+        max_rugcheck_score: 700
+      holders:
+        min_holders: 50
+        max_top10_pct: 65
+        max_single_wallet_pct: 20
+        max_block0_snipe_pct: 50
+        block0_hard_reject: false
+      scoring:
+        enabled: true
+        min_score: 0.55
+        weights:
+          momentum: 0.35
+          liquidity: 0.20
+          buy_pressure: 0.25
+          safety: 0.20
+      pullback:
+        min_pullback_pct: 15
+        max_pullback_pct: 55
+        min_5m_vol_after_pullback: 1000
+        vol_recovery_ratio: 0.30
+        max_hours_to_watch: 12
+      milestones:
+        vs_alert_mc: [2, 5, 10]
+        vs_entry: [2, 3, 5]
+
+    strategy_b:
+      enabled: true
+      label: "🎯 SWING"
+      age:
+        min_hours: 6
+        max_hours: 120
+      market_cap:
+        min: 100000
+        max: 5000000
+      liquidity:
+        min: 40000
+        max: 500000
+        liq_to_mc_min_pct: 8
+        liq_to_mc_max_pct: 40
+      volume:
+        min_24h: 200000
+        min_1h: 10000
+        min_5m: 2000
+        vol_liq_min_ratio: 1.5
+        vol_liq_hard_reject: 20.0
+      price_change:
+        min_1h_pct: -15
+        min_24h_pct: 50
+        max_24h_pct: 5000
+        pullback_from_high_min_pct: 20
+        pullback_from_high_max_pct: 60
+      buy_sell:
+        min_buy_ratio_1h: 0.52
+        strong_buy_ratio_1h: 0.60
+        min_tx_count_1h: 30
+        min_tx_count_24h: 200
+      security:
+        require_mint_renounced: true
+        require_freeze_renounced: true
+        allow_mutable_metadata: false
+        max_rugcheck_score: 500
+      holders:
+        min_holders: 200
+        max_top10_pct: 50
+        max_single_wallet_pct: 15
+        max_block0_snipe_pct: 40
+        block0_hard_reject: false
+      scoring:
+        enabled: true
+        min_score: 0.62
+        weights:
+          momentum: 0.28
+          liquidity: 0.20
+          holder_growth: 0.18
+          buy_pressure: 0.17
+          safety: 0.17
+      pullback:
+        min_pullback_pct: 20
+        max_pullback_pct: 60
+        min_5m_vol_after_pullback: 2000
+        vol_recovery_ratio: 0.35
+        max_hours_to_watch: 48
+      milestones:
+        vs_alert_mc: [2, 5, 10]
+        vs_entry: [2, 3, 5]
+
+    global:
+      max_alerts_per_scan: 5
+      summary_hours_utc: [10, 20]
+      show_filter_failure_breakdown: true
+      interim_report_frequency: daily
+      chains:
+        - solana
+      logging:
+        level: INFO
+        log_to_file: true
+        log_file: logs/screener.log
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memecoin-screener
+  namespace: screener
+  labels:
+    app: memecoin-screener
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memecoin-screener
+  template:
+    metadata:
+      labels:
+        app: memecoin-screener
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: worker-contabo
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+
+        # ── Screener — both strategies, tracker thread ────────
+        - name: screener
+          image: covenantwealth/memecoin-screener:v1
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            - secretRef:
+                name: screener-secrets
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: logs
+              mountPath: /app/logs
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "384Mi"
+              cpu: "500m"
+
+        # ── Dashboard — Flask UI on port 8080 ─────────────────
+        - name: dashboard
+          image: covenantwealth/memecoin-screener:v1
+          imagePullPolicy: Always
+          command: ["python", "dashboard.py"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            - secretRef:
+                name: screener-secrets
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "192Mi"
+              cpu: "200m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: screener-config
+        - name: logs
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: screener-dashboard
+  namespace: screener
+spec:
+  selector:
+    app: memecoin-screener
+  ports:
+    - port: 8080
+      targetPort: 8080
