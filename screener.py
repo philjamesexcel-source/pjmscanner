@@ -143,33 +143,90 @@ def fetch_rugcheck(mint: str) -> dict:
 def parse_rugcheck(data: dict) -> dict:
     if not data:
         return {}
+
     risks  = data.get("risks") or []
     score  = data.get("score") or 0
     fields = data.get("tokenMeta") or {}
-    top10  = 0
-    max_w  = 0
-    blk0   = 0
-    holders = len(data.get("topHolders") or [])
 
-    for h in (data.get("topHolders") or [])[:10]:
-        top10 += float(h.get("pct") or 0)
-    for h in (data.get("topHolders") or []):
+    # ── Holder data ──────────────────────────────────────────
+    top_holders = data.get("topHolders") or []
+    holders = data.get("totalHolders") or len(top_holders)
+    top10 = 0
+    max_w = 0
+    blk0  = 0
+    for h in top_holders[:10]:
         pct = float(h.get("pct") or 0)
+        # RugCheck returns pct as 0–100 or 0–1 depending on version
+        top10 += pct if pct > 1 else pct * 100
+    for h in top_holders:
+        pct = float(h.get("pct") or 0)
+        pct = pct if pct > 1 else pct * 100
         max_w = max(max_w, pct)
-    for h in (data.get("topHolders") or []):
         if h.get("isBlock0"):
-            blk0 += float(h.get("pct") or 0)
+            blk0 += pct
+
+    # ── Mint / Freeze authority ───────────────────────────────
+    mint_renounced   = data.get("mintAuthority") is None
+    freeze_renounced = data.get("freezeAuthority") is None
+    # Double-check via risks list
+    for risk in risks:
+        name = (risk.get("name") or "").lower()
+        if "mint" in name and "enabled" in name:
+            mint_renounced = False
+        if "freeze" in name and "enabled" in name:
+            freeze_renounced = False
+
+    # ── Mutable metadata ─────────────────────────────────────
+    update_auth     = data.get("updateAuthority")
+    mutable_meta    = fields.get("mutable", True)
+    mutable_risks   = {"mutable metadata", "mutable", "metadata mutable", "metadata is mutable"}
+    mutable_in_risk = any(
+        (risk.get("name") or "").lower().strip() in mutable_risks
+        for risk in risks
+    )
+    mutable_metadata = mutable_meta or mutable_in_risk or bool(update_auth)
+
+    # ── Deployer ─────────────────────────────────────────────
+    deployer = None
+    markets  = data.get("markets") or []
+    if markets:
+        deployer = markets[0].get("deployer") or markets[0].get("creator")
+    if not deployer:
+        deployer = data.get("creator") or data.get("deployer")
+    if not deployer and update_auth:
+        deployer = update_auth
+
+    # ── LP lock ──────────────────────────────────────────────
+    lp_locked_pct = 0.0
+    iliq_pct      = 0.0
+    if markets:
+        lp = markets[0].get("lp") or {}
+        lp_locked_pct = float(lp.get("lpLockedPct") or 0)
+        iliq_pct      = float(lp.get("pctReserve") or 0)
+
+    # ── Risk summary ─────────────────────────────────────────
+    risk_names = [r.get("name", "") for r in risks]
+    if not risk_names:
+        risk_summary = "✅ Looks clean"
+    elif len(risk_names) == 1:
+        risk_summary = f"⚠️ {risk_names[0]}"
+    else:
+        risk_summary = f"⚠️ {risk_names[0]}"
 
     return {
-        "score":              float(score),
-        "mint_renounced":     data.get("mintAuthority") is None,
-        "freeze_renounced":   data.get("freezeAuthority") is None,
-        "mutable_metadata":   fields.get("mutable", False),
-        "total_holders":      holders,
-        "top10_pct":          round(top10, 2),
+        "score":               float(score),
+        "mint_renounced":      mint_renounced,
+        "freeze_renounced":    freeze_renounced,
+        "mutable_metadata":    mutable_metadata,
+        "total_holders":       holders,
+        "top10_pct":           round(top10, 2),
         "max_single_wallet_pct": round(max_w, 2),
-        "block0_snipe_pct":   round(blk0, 2),
-        "risks":              [r.get("name", "") for r in risks],
+        "block0_snipe_pct":    round(blk0, 2) if blk0 > 0 else None,
+        "lp_locked_pct":       lp_locked_pct,
+        "iliq_pct":            iliq_pct,
+        "deployer":            deployer,
+        "risks":               risk_names,
+        "risk_summary":        risk_summary,
     }
 
 
