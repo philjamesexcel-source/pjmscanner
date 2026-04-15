@@ -1,0 +1,43 @@
+# ============================================================
+#  WALLET TRACKING CONFIG
+#  Tracks smart money wallets and alerts when they buy new tokens.
+# ============================================================
+
+enabled: true
+
+# ── Wallet qualification criteria ────────────────────────────
+qualification:
+  min_wallet_roi: 2.5           # minimum average ROI multiplier
+  min_successful_trades: 5      # minimum winning trades tracked
+  entry_mc_min_usd: 20000       # they enter at low MC
+  entry_mc_max_usd: 500000      # not buying already pumped coins
+  min_win_rate: 0.55            # 55%+ win rate
+
+# ── Wallet scoring ────────────────────────────────────────────
+scoring:
+  wallet_win_rate_weight: 0.35
+  average_roi_weight: 0.35
+  early_entry_accuracy_weight: 0.30
+  min_wallet_score: 0.60        # 0–1, must exceed to be tracked
+
+# ── Alert triggers ────────────────────────────────────────────
+alerts:
+  min_wallets_buying: 2         # alert when N tracked wallets buy same token
+  min_buy_size_usd: 500         # minimum buy size to register
+  alert_on_single_whale: true   # alert if single high-score wallet buys
+  whale_score_threshold: 0.85
+
+# ── Tracking settings ─────────────────────────────────────────
+tracking:
+  max_tracked_wallets: 500
+  refresh_wallet_scores_hours: 24
+  helius_lookback_transactions: 100
+  daily_reset_hour_utc: 0       # reset daily stats at midnight UTC
+
+# ── Data sources ─────────────────────────────────────────────
+data_sources:
+  helius:
+    enabled: true
+    max_tx_per_wallet: 100
+  solscan:
+    enabled: true

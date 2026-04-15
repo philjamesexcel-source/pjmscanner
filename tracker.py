@@ -1,14 +1,10 @@
-#!/usr/bin/env python3
 """
-tracker.py — Background monitoring thread.
-Runs every 5 minutes. Does three things:
-  1. Updates live prices and peak/lowest tracking
-  2. Checks for pullback entry conditions
-  3. Fires milestone alerts (2x, 5x, 10x)
-  4. Processes 72h outcome checks
-  5. Sends interim reports at 23:00 EAT
+wallet_tracker/tracker.py — Smart wallet tracking.
+Monitors tracked wallets via Helius RPC, scores them,
+and fires alerts when they buy tokens matching our criteria.
 """
 
+import os
 import logging
 import time
 import threading
@@ -16,407 +12,287 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
-import db
-from alerts import (
-    send_telegram,
-    build_pullback_alert,
-    build_milestone_alert,
-    build_outcome_alert,
+
+from core import database as db
+from core.rate_limiter import wait as rl_wait
+from core.circuit_breaker import get_breaker, CircuitOpenError
+
+logger = logging.getLogger(__name__)
+
+HELIUS_URL = os.environ.get(
+    "HELIUS_RPC_URL",
+    "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
 )
-
-HEADERS        = {"User-Agent": "MemecoinScreener/1.0"}
-CHECK_INTERVAL = 300   # 5 minutes
+HEADERS = {"Content-Type": "application/json"}
 
 
 # ─────────────────────────────────────────────
-# DATA FETCHER
+# HELIUS CALLS
 # ─────────────────────────────────────────────
 
-def fetch_pair_data(pair_addr: str) -> Optional[dict]:
-    """Fetch current pair data from DexScreener."""
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_addr}"
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        pairs = r.json().get("pairs") or []
-        return pairs[0] if pairs else None
-    except Exception as e:
-        logging.warning(f"Tracker: fetch failed for {pair_addr[:8]}: {e}")
+def _helius_post(payload: dict, retries: int = 2) -> Optional[dict]:
+    cb = get_breaker("helius", failure_threshold=5, recovery_timeout=30)
+    for attempt in range(retries):
+        try:
+            rl_wait("helius")
+
+            def _call():
+                r = requests.post(
+                    HELIUS_URL, json=payload,
+                    headers=HEADERS, timeout=15
+                )
+                r.raise_for_status()
+                return r.json()
+
+            return cb.call(_call)
+        except CircuitOpenError:
+            logger.warning("Helius circuit OPEN")
+            return None
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                logger.debug(f"Helius failed: {e}")
+    return None
+
+
+def get_wallet_transactions(address: str, limit: int = 100) -> list:
+    """Get recent transactions for a wallet address."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignaturesForAddress",
+        "params": [address, {"limit": limit}]
+    }
+    result = _helius_post(payload)
+    if result and "result" in result:
+        return result["result"]
+    return []
+
+
+def get_transaction_detail(signature: str) -> Optional[dict]:
+    """Get full detail of a transaction."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+    }
+    result = _helius_post(payload)
+    return result.get("result") if result else None
+
+
+# ─────────────────────────────────────────────
+# WALLET SCORING
+# ─────────────────────────────────────────────
+
+def score_wallet(address: str, cfg: dict) -> Optional[dict]:
+    """
+    Score a wallet based on its trading history.
+    Returns scoring dict or None if insufficient data.
+    """
+    qual_cfg = cfg.get("qualification", {})
+    min_trades = qual_cfg.get("min_successful_trades", 5)
+
+    txns = get_wallet_transactions(address, limit=100)
+    if not txns:
         return None
 
+    # For a real implementation, parse each tx to identify:
+    # - token purchases at various MCs
+    # - exit prices
+    # - compute ROI per trade
+    #
+    # Here we return a placeholder structure.
+    # Full implementation requires parsing SPL token transfer instructions
+    # from transaction data.
 
-def _classify(multiplier: float) -> str:
-    if multiplier >= 5:   return "moon"
-    if multiplier >= 2:   return "up"
-    if multiplier >= 0.8: return "flat"
-    if multiplier > 0:    return "down"
-    return "dead"
+    # Placeholder scoring logic
+    total_trades    = len(txns)
+    winning_trades  = int(total_trades * 0.6)   # placeholder
+    win_rate        = winning_trades / total_trades if total_trades > 0 else 0
+    avg_roi         = 2.5   # placeholder — real impl: compute from tx history
+    early_accuracy  = 0.7   # placeholder — % entries below $200K MC
 
+    if total_trades < min_trades:
+        return None
 
-# ─────────────────────────────────────────────
-# PULLBACK DETECTION
-# ─────────────────────────────────────────────
-
-def _check_pullback(alert: dict, current_pair: dict,
-                    strategy_cfg: dict,
-                    tg_token: str, tg_chat: str):
-    """
-    Check if a coin has pulled back to a good entry zone.
-    Conditions:
-      - Price has dropped pullback_min_pct to pullback_max_pct from peak
-      - 5m volume above threshold (shows activity at the dip)
-      - Vol at pullback >= vol_recovery_ratio * (some baseline)
-    """
-    alert_id   = alert["id"]
-    peak_price = float(alert.get("peak_price") or alert.get("price_at_alert") or 0)
-    if peak_price <= 0:
-        return
-
-    current_price = float(current_pair.get("priceUsd") or 0)
-    if current_price <= 0:
-        return
-
-    # Has already had a pullback alert sent? Don't spam
-    existing = db.get_latest_pullback(alert_id)
-    if existing:
-        # Don't resend within 2 hours
-        sent_at = existing.get("sent_at")
-        if sent_at and (datetime.now(timezone.utc) - sent_at).total_seconds() < 7200:
-            return
-
-    pullback_pct = ((peak_price - current_price) / peak_price) * 100
-    pb_cfg       = strategy_cfg.get("pullback", {})
-    min_pb       = pb_cfg.get("min_pullback_pct", 15)
-    max_pb       = pb_cfg.get("max_pullback_pct", 60)
-
-    if pullback_pct < min_pb or pullback_pct > max_pb:
-        return
-
-    # Check volume recovery
-    vol_5m         = float((current_pair.get("volume") or {}).get("m5") or 0)
-    min_vol        = pb_cfg.get("min_5m_vol_after_pullback", 0)
-    if vol_5m < min_vol:
-        return
-
-    # All conditions met — fire pullback alert
-    strategy_label = strategy_cfg.get("label", "")
-    current_mc = current_pair.get("marketCap") or 0
-
-    msg, buttons = build_pullback_alert(
-        alert          = alert,
-        current_pair   = current_pair,
-        pullback_pct   = pullback_pct,
-        strategy_label = strategy_label,
+    # Composite wallet score
+    sc_cfg     = cfg.get("scoring", {})
+    score = (
+        win_rate        * sc_cfg.get("wallet_win_rate_weight", 0.35) +
+        min(avg_roi / 10, 1.0) * sc_cfg.get("average_roi_weight", 0.35) +
+        early_accuracy  * sc_cfg.get("early_entry_accuracy_weight", 0.30)
     )
-    sent = send_telegram(tg_token, tg_chat, msg, buttons)
 
-    if sent:
-        db.insert_pullback_alert(
-            alert_id          = alert_id,
-            mint              = alert["mint"],
-            symbol            = alert["symbol"],
-            strategy          = alert["strategy"],
-            mc_at_pullback    = float(current_mc),
-            price_at_pullback = current_price,
-            pullback_pct      = pullback_pct,
-            vol_5m            = vol_5m,
-        )
-        logging.info(
-            f"Tracker: pullback alert sent {alert['symbol']} "
-            f"({pullback_pct:.1f}% from peak)"
-        )
+    return {
+        "address":       address,
+        "score":         round(score, 4),
+        "win_rate":      round(win_rate, 4),
+        "avg_roi":       round(avg_roi, 4),
+        "early_accuracy": round(early_accuracy, 4),
+        "total_trades":  total_trades,
+        "winning_trades": winning_trades,
+    }
 
 
 # ─────────────────────────────────────────────
-# MILESTONE CHECKS
+# TRADE DETECTION
 # ─────────────────────────────────────────────
 
-def _check_milestones(alert: dict, current_pair: dict,
-                       strategy_cfg: dict,
-                       tg_token: str, tg_chat: str):
-    """Check and fire 2x, 5x, 10x milestones."""
-    alert_id    = alert["id"]
-    mc_at_alert = float(alert.get("mc_at_alert") or 0)
-    current_mc  = float(current_pair.get("marketCap") or 0)
-    current_price = float(current_pair.get("priceUsd") or 0)
-    strategy_label = strategy_cfg.get("label", "")
+def detect_new_buys(wallets: list, known_mints: set,
+                     cfg: dict) -> list:
+    """
+    Check recent transactions for tracked wallets.
+    Returns list of new buy events.
+    """
+    new_buys  = []
+    qual_cfg  = cfg.get("qualification", {})
+    min_buy   = float(cfg.get("alerts", {}).get("min_buy_size_usd", 500))
+    mc_min    = float(qual_cfg.get("entry_mc_min_usd", 20000))
+    mc_max    = float(qual_cfg.get("entry_mc_max_usd", 500000))
 
-    if mc_at_alert <= 0 or current_mc <= 0:
-        return
+    for wallet in wallets:
+        address = wallet.get("address", "")
+        if not address:
+            continue
 
-    # vs alert MC
-    mult_vs_alert = current_mc / mc_at_alert
-    for m in strategy_cfg.get("milestones", {}).get("vs_alert_mc", [2, 5, 10]):
-        if mult_vs_alert >= m and not db.milestone_sent(alert_id, "vs_alert", m):
-            msg, buttons = build_milestone_alert(
-                alert          = alert,
-                milestone_type = "vs_alert",
-                multiplier     = m,
-                current_mc     = current_mc,
-                current_price  = current_price,
-                strategy_label = strategy_label,
-            )
-            if send_telegram(tg_token, tg_chat, msg, buttons):
-                db.insert_milestone(
-                    alert_id           = alert_id,
-                    mint               = alert["mint"],
-                    strategy           = alert["strategy"],
-                    milestone_type     = "vs_alert",
-                    multiplier         = m,
-                    mc_at_milestone    = current_mc,
-                    price_at_milestone = current_price,
+        txns = get_wallet_transactions(address, limit=10)
+        time.sleep(0.2)
+
+        for tx_info in txns:
+            sig = tx_info.get("signature")
+            if not sig:
+                continue
+
+            # Skip if we've already processed this transaction
+            # (in production, track processed signatures in DB)
+            detail = get_transaction_detail(sig)
+            if not detail:
+                continue
+
+            # Parse token transfers from transaction
+            # This is simplified — real implementation parses
+            # preTokenBalances / postTokenBalances
+            meta = detail.get("meta") or {}
+            pre_balances  = meta.get("preTokenBalances") or []
+            post_balances = meta.get("postTokenBalances") or []
+
+            for post in post_balances:
+                mint = post.get("mint")
+                if not mint or mint in known_mints:
+                    continue
+
+                owner = (post.get("owner") or "").lower()
+                if owner != address.lower():
+                    continue
+
+                # Get amount change
+                pre = next(
+                    (p for p in pre_balances if p.get("mint") == mint),
+                    {"uiTokenAmount": {"uiAmount": 0}}
                 )
-                logging.info(
-                    f"Tracker: milestone {m}x vs alert — {alert['symbol']}"
-                )
+                pre_amt  = float((pre.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                post_amt = float((post.get("uiTokenAmount") or {}).get("uiAmount") or 0)
 
-    # vs entry price (pullback entry)
-    pullback = db.get_latest_pullback(alert_id)
-    if pullback:
-        entry_mc = float(pullback.get("mc_at_pullback") or 0)
-        if entry_mc > 0:
-            mult_vs_entry = current_mc / entry_mc
-            for m in strategy_cfg.get("milestones", {}).get("vs_entry", [2, 3, 5]):
-                if mult_vs_entry >= m and not db.milestone_sent(
-                    alert_id, "vs_entry", m
-                ):
-                    msg, buttons = build_milestone_alert(
-                        alert          = alert,
-                        milestone_type = "vs_entry",
-                        multiplier     = m,
-                        current_mc     = current_mc,
-                        current_price  = current_price,
-                        strategy_label = strategy_label,
-                    )
-                    if send_telegram(tg_token, tg_chat, msg, buttons):
-                        db.insert_milestone(
-                            alert_id           = alert_id,
-                            mint               = alert["mint"],
-                            strategy           = alert["strategy"],
-                            milestone_type     = "vs_entry",
-                            multiplier         = m,
-                            mc_at_milestone    = current_mc,
-                            price_at_milestone = current_price,
-                        )
-                        logging.info(
-                            f"Tracker: milestone {m}x vs entry — {alert['symbol']}"
-                        )
+                if post_amt > pre_amt:
+                    new_buys.append({
+                        "wallet_address": address,
+                        "wallet_score":   float(wallet.get("score") or 0),
+                        "mint":           mint,
+                        "symbol":         "?",
+                        "amount_tokens":  post_amt - pre_amt,
+                        "tx_signature":   sig,
+                    })
 
-
-# ─────────────────────────────────────────────
-# 72H OUTCOME CHECKS
-# ─────────────────────────────────────────────
-
-def _process_72h_outcomes(tg_token: str, tg_chat: str, cfg: dict):
-    """Process all alerts whose 72h window has elapsed."""
-    due = db.get_pending_72h_checks()
-    if not due:
-        return
-
-    logging.info(f"Tracker: {len(due)} entries due for 72h check")
-
-    # Get strategy configs
-    strategy_a_cfg = cfg.get("strategy_a", {})
-    strategy_b_cfg = cfg.get("strategy_b", {})
-
-    for alert in due:
-        pair = fetch_pair_data(alert["pair_addr"])
-        time.sleep(1)
-
-        mc_now = float((pair.get("marketCap") or 0)) if pair else 0
-        mc_at_alert = float(alert.get("mc_at_alert") or 0)
-
-        mult_vs_alert = (mc_now / mc_at_alert) if mc_at_alert > 0 and mc_now > 0 else 0
-        outcome = _classify(mult_vs_alert) if mult_vs_alert > 0 else "dead"
-
-        # vs entry
-        pullback = db.get_latest_pullback(alert["id"])
-        mult_vs_entry = None
-        if pullback:
-            entry_mc = float(pullback.get("mc_at_pullback") or 0)
-            if entry_mc > 0 and mc_now > 0:
-                mult_vs_entry = mc_now / entry_mc
-
-        db.insert_outcome(
-            alert_id      = alert["id"],
-            mint          = alert["mint"],
-            strategy      = alert["strategy"],
-            mc_at_72h     = mc_now if mc_now > 0 else None,
-            mult_vs_alert = round(mult_vs_alert, 3) if mult_vs_alert else None,
-            mult_vs_entry = round(mult_vs_entry, 3) if mult_vs_entry else None,
-            outcome       = outcome,
-        )
-        db.stop_watching_pullback(alert["id"])
-
-        # Get strategy label
-        s = alert.get("strategy", "A")
-        s_cfg = strategy_a_cfg if s == "A" else strategy_b_cfg
-        strategy_label = s_cfg.get("label", f"Strategy {s}")
-
-        msg, buttons = build_outcome_alert(
-            alert          = alert,
-            mc_at_72h      = mc_now,
-            mult_vs_alert  = mult_vs_alert,
-            mult_vs_entry  = mult_vs_entry,
-            outcome        = outcome,
-            strategy_label = strategy_label,
-        )
-        send_telegram(tg_token, tg_chat, msg, buttons)
-        logging.info(
-            f"Tracker: 72h result {alert['symbol']} "
-            f"→ {mult_vs_alert:.2f}x ({outcome})"
-        )
-
-
-# ─────────────────────────────────────────────
-# INTERIM REPORT
-# ─────────────────────────────────────────────
-
-def _send_interim_report(tg_token: str, tg_chat: str):
-    pending = db.get_all_pending_alerts()
-    if not pending:
-        return
-
-    now_utc = datetime.now(timezone.utc)
-    lines = [f"🔭 <b>Interim Snapshot — {len(pending)} coin(s) tracked</b>\n"]
-
-    for alert in pending:
-        pair = fetch_pair_data(alert["pair_addr"])
-        time.sleep(0.5)
-
-        mc_alert  = float(alert.get("mc_at_alert") or 0)
-        check_due = alert.get("check_due_at")
-        hours_left = max(0, (check_due - now_utc).total_seconds() / 3600) if check_due else 0
-        strategy = alert.get("strategy", "?")
-
-        if pair:
-            mc_now = float(pair.get("marketCap") or 0)
-            mult   = (mc_now / mc_alert) if mc_alert > 0 and mc_now > 0 else 0
-            trend  = "🚀" if mult >= 5 else ("📈" if mult >= 2 else ("➡️" if mult >= 0.8 else "📉"))
-            mc_str = f"${mc_now:,.0f}"
-        else:
-            mult   = 0
-            trend  = "💀"
-            mc_str = "N/A"
-
-        dex_url = f"https://dexscreener.com/solana/{alert['pair_addr']}"
-        lines.append(
-            f"{trend} <a href=\"{dex_url}\"><b>{alert['name']} ({alert['symbol']})</b></a>"
-            f" [{strategy}]\n"
-            f"   MC alert: ${mc_alert:,.0f} → {mc_str}"
-            + (f" <b>({mult:.2f}x)</b>" if mult > 0 else "")
-            + f" | 72h in: {hours_left:.0f}h"
-        )
-
-    send_telegram(tg_token, tg_chat, "\n\n".join(lines))
-    logging.info(f"Tracker: interim report sent — {len(pending)} coins")
+    return new_buys
 
 
 # ─────────────────────────────────────────────
 # BACKGROUND THREAD
 # ─────────────────────────────────────────────
 
-def start_background_checker(tg_token: str, tg_chat: str, cfg: dict):
-    strategy_a_cfg = cfg.get("strategy_a", {})
-    strategy_b_cfg = cfg.get("strategy_b", {})
-    interim_freq   = cfg.get("global", {}).get("interim_report_frequency", "daily")
-    INTERIM_HOUR   = 20   # 23:00 EAT = 20:00 UTC
+def start(tg_token: str, tg_chat: str, cfg: dict):
+    wallet_cfg = cfg.get("wallets", {})
+    if not wallet_cfg.get("enabled", True):
+        logger.info("Wallet tracker disabled in config")
+        return
 
-    last_interim_key = None
+    interval  = cfg.get("global", {}).get("tracker_interval_seconds", 60)
+    min_score = float(wallet_cfg.get("scoring", {}).get("min_wallet_score", 0.60))
+    daily_reset_hour = int(
+        wallet_cfg.get("tracking", {}).get("daily_reset_hour_utc", 0)
+    )
+
+    last_reset_day = None
 
     def _loop():
-        nonlocal last_interim_key
-        logging.info("Tracker: background checker started")
+        nonlocal last_reset_day
+        logger.info("Wallet tracker started")
 
         while True:
             try:
                 now = datetime.now(timezone.utc)
 
-                # Process all monitored alerts
-                all_alerts = db.get_alerts_for_monitoring()
+                # Daily reset
+                if now.hour == daily_reset_hour and now.date() != last_reset_day:
+                    last_reset_day = now.date()
+                    logger.info("Wallet tracker: daily reset")
 
-                for alert in all_alerts:
-                    pair = fetch_pair_data(alert["pair_addr"])
-                    if not pair:
-                        time.sleep(0.5)
-                        continue
+                # Load tracked wallets
+                wallets = db.get_active_wallets(min_score=min_score)
+                if not wallets:
+                    logger.debug("No tracked wallets")
+                    time.sleep(interval)
+                    continue
 
-                    current_price = float(pair.get("priceUsd") or 0)
-                    current_mc    = float(pair.get("marketCap") or 0)
+                # Get known mints (to avoid re-alerting)
+                # In production: pull from wallet_trades or alerts table
 
-                    if current_price > 0 and current_mc > 0:
-                        # Update peak/lowest
-                        db.update_peak_and_lowest(
-                            alert["id"], current_price, current_mc
-                        )
+                # Detect new buys
+                new_buys = detect_new_buys(wallets, set(), wallet_cfg)
 
-                        # Reload updated alert for accurate peak values
-                        fresh_alerts = db.get_alerts_for_monitoring()
-                        fresh = next(
-                            (a for a in fresh_alerts if a["id"] == alert["id"]),
-                            alert
-                        )
+                # Group by mint and alert if threshold met
+                from collections import defaultdict
+                by_mint = defaultdict(list)
+                for buy in new_buys:
+                    by_mint[buy["mint"]].append(buy)
 
-                        # Get strategy config
-                        s_cfg = (strategy_a_cfg if fresh["strategy"] == "A"
-                                 else strategy_b_cfg)
-
-                        # Check pullback entry
-                        max_hours = s_cfg.get("pullback", {}).get(
-                            "max_hours_to_watch", 48
-                        )
-                        hours_since = (
-                            (now - fresh["alerted_at"]).total_seconds() / 3600
-                        )
-                        if hours_since <= max_hours:
-                            _check_pullback(
-                                fresh, pair, s_cfg, tg_token, tg_chat
+                min_wallets = int(
+                    wallet_cfg.get("alerts", {}).get("min_wallets_buying", 2)
+                )
+                for mint, buys in by_mint.items():
+                    if len(buys) >= min_wallets:
+                        # Store and alert
+                        for buy in buys:
+                            db.insert_wallet_trade(
+                                wallet_address = buy["wallet_address"],
+                                mint           = mint,
+                                symbol         = buy.get("symbol", "?"),
+                                action         = "buy",
+                                amount_usd     = buy.get("amount_usd"),
+                                mc_at_trade    = buy.get("mc"),
+                                price_at_trade = buy.get("price"),
+                                tx_signature   = buy.get("tx_signature"),
                             )
 
-                        # Check milestones
-                        _check_milestones(
-                            fresh, pair, s_cfg, tg_token, tg_chat
-                        )
+                        from alerts.telegram import build_wallet_alert, send
+                        # Enrich buys with wallet scores
+                        scored_buys = []
+                        for buy in buys:
+                            w = next((w for w in wallets
+                                     if w["address"] == buy["wallet_address"]), {})
+                            scored_buys.append({**buy, "score": w.get("score", 0)})
 
-                        # Update live metrics
-                        pullback = db.get_latest_pullback(fresh["id"])
-                        entry_mc = float(
-                            pullback.get("mc_at_pullback") or 0
-                        ) if pullback else None
-                        vol = pair.get("volume") or {}
-                        pc  = pair.get("priceChange") or {}
-                        db.upsert_live_metrics(
-                            alert_id       = fresh["id"],
-                            mint           = fresh["mint"],
-                            strategy       = fresh["strategy"],
-                            current_mc     = current_mc,
-                            current_price  = current_price,
-                            current_liq    = (pair.get("liquidity") or {}).get("usd"),
-                            vol_24h        = vol.get("h24"),
-                            vol_5m         = vol.get("m5"),
-                            price_change_1h  = pc.get("h1"),
-                            price_change_24h = pc.get("h24"),
-                            mc_at_alert    = float(fresh.get("mc_at_alert") or 0),
-                            entry_price    = entry_mc,
-                        )
-
-                    time.sleep(0.5)
-
-                # 72h outcome checks
-                _process_72h_outcomes(tg_token, tg_chat, cfg)
-
-                # Interim report at 23:00 EAT
-                if interim_freq == "daily":
-                    key = (now.date(), now.hour)
-                    if now.hour == INTERIM_HOUR and key != last_interim_key:
-                        last_interim_key = key
-                        _send_interim_report(tg_token, tg_chat)
+                        msg, buttons = build_wallet_alert(scored_buys, 0)
+                        if msg:
+                            send(tg_token, tg_chat, msg, buttons)
 
             except Exception as e:
-                logging.error(f"Tracker error: {e}", exc_info=True)
+                logger.error(f"Wallet tracker error: {e}", exc_info=True)
 
-            time.sleep(CHECK_INTERVAL)
+            time.sleep(interval)
 
-    t = threading.Thread(target=_loop, daemon=True, name="tracker-checker")
+    t = threading.Thread(target=_loop, daemon=True, name="wallet-tracker")
     t.start()
-    logging.info(f"Tracker: running every {CHECK_INTERVAL//60} min")
+    logger.info("Wallet tracker thread running")

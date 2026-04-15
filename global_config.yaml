@@ -1,0 +1,82 @@
+# ============================================================
+#  GLOBAL CONFIG — pjmscanner
+#  Baseline filters applied before any strategy runs.
+#  All values here are MINIMUMS. Strategy configs override upward.
+# ============================================================
+
+version: "1.0.0"
+
+# ── Strategy toggles ─────────────────────────────────────────
+enable_strategy_a: true    # Safe — Raydium/Bonded
+enable_strategy_b: true    # Momentum — 1h–24h
+enable_strategy_c: true    # Second Wave — 6h–5d
+
+# ── Scan settings ────────────────────────────────────────────
+scan_interval_seconds: 120   # main discovery loop
+tracker_interval_seconds: 60  # price/wallet tracking loop
+
+# ── Networks ─────────────────────────────────────────────────
+networks:
+  solana:
+    enabled: true
+    gecko_network: solana
+  # ethereum:
+  #   enabled: false
+  #   gecko_network: eth
+  # bsc:
+  #   enabled: false
+  #   gecko_network: bsc
+
+# ── Global baseline filters ──────────────────────────────────
+# Any token failing these is rejected before strategy evaluation
+filters:
+  min_liquidity_usd: 20000
+  max_top_holder_percent: 20
+  max_dev_wallet_percent: 10
+  min_holders: 120
+  min_txns_5m: 80
+  min_volume_5m_usd: 10000
+  min_buy_sell_ratio: 1.1
+  max_fake_volume_ratio: 0.3
+  require_lp_locked: true
+  rugcheck_pass_required: true
+  max_rugcheck_score: 800
+
+# ── Scoring weights ──────────────────────────────────────────
+scoring:
+  liquidity_weight: 0.20
+  volume_weight: 0.20
+  momentum_weight: 0.25
+  holder_distribution_weight: 0.15
+  wallet_activity_weight: 0.10
+  risk_weight: 0.10
+  min_score_to_alert: 60   # 0–100
+
+# ── Alerts ───────────────────────────────────────────────────
+alerts:
+  max_per_scan: 10
+  cooldown_minutes: 60       # don't re-alert same token within this window
+  summary_hours_utc: [10, 20] # 13:00 and 23:00 EAT
+
+# ── Milestones ────────────────────────────────────────────────
+milestones:
+  vs_detection: [2, 5, 10, 20]   # x multiples vs MC at detection
+  vs_entry: [2, 3, 5, 10]        # x multiples vs MC at entry signal
+
+# ── Logging ──────────────────────────────────────────────────
+logging:
+  level: INFO
+  log_to_file: true
+  log_file: logs/pjmscanner.log
+
+# ── Health checks ─────────────────────────────────────────────
+health:
+  port: 9090
+  stale_scan_threshold_minutes: 10   # alert if no scan in this long
+
+# ── Config stability ─────────────────────────────────────────
+config_management:
+  max_versions_kept: 10
+  auto_revert_on_crash: true
+  crash_threshold: 3            # crashes within stability_window to trigger revert
+  stability_window_minutes: 5

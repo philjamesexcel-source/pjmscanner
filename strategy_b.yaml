@@ -1,0 +1,85 @@
+# ============================================================
+#  STRATEGY B — MOMENTUM (1h–24h)
+#  Targets tokens in active momentum phase.
+#  Higher risk, higher potential. Focus on velocity and volume.
+# ============================================================
+
+enabled: true
+label: "⚡ MOMENTUM"
+description: "Active momentum tokens, 1h–24h old"
+
+# ── Age window ───────────────────────────────────────────────
+age:
+  min_minutes: 60
+  max_hours: 24
+
+# ── Market cap ───────────────────────────────────────────────
+market_cap:
+  min_usd: 30000
+  max_usd: 500000
+
+# ── Liquidity ────────────────────────────────────────────────
+liquidity:
+  min_usd: 15000
+  require_lp_locked: false    # bonding curve tokens may have 0 lock
+  allow_bonding_curve: true
+  liq_to_mc_min_pct: 4
+
+# ── Volume ───────────────────────────────────────────────────
+volume:
+  min_5m_usd: 12000
+  min_15m_usd: 25000
+  min_1h_usd: 50000
+
+# ── Transactions ─────────────────────────────────────────────
+transactions:
+  min_5m: 100
+  min_15m: 250
+
+# ── Buy/Sell pressure ────────────────────────────────────────
+pressure:
+  min_buy_sell_ratio: 1.3
+  strong_buy_sell_ratio: 1.6
+  min_new_wallets_5m: 25      # wallet velocity signal
+
+# ── Holders ──────────────────────────────────────────────────
+holders:
+  min_count: 150
+  max_top_holder_pct: 18
+  max_dev_wallet_pct: 10
+  max_block0_snipe_pct: 40    # more lenient for new tokens
+
+# ── Security ─────────────────────────────────────────────────
+security:
+  require_mint_renounced: true
+  require_freeze_renounced: true
+  allow_mutable_metadata: true    # more lenient for momentum
+  max_rugcheck_score: 700
+
+# ── Momentum scoring ─────────────────────────────────────────
+momentum:
+  threshold: 0.75              # min momentum sub-score (0–1)
+  min_price_change_5m_pct: 2
+  min_price_change_1h_pct: 15
+  max_price_change_1h_pct: 300 # reject likely pump-and-dump
+
+# ── Pullback entry ───────────────────────────────────────────
+pullback:
+  enabled: true
+  min_pct: 20
+  max_pct: 40
+  min_vol_recovery_ratio: 0.7
+  min_txn_recovery_ratio: 0.7
+  require_higher_low: true
+  max_consecutive_red_candles: 4
+  watch_window_hours: 8        # shorter window for fast tokens
+
+# ── Scoring overrides ─────────────────────────────────────────
+scoring:
+  min_score: 60
+  momentum_weight: 0.35        # momentum is king here
+  volume_weight: 0.25
+  liquidity_weight: 0.15
+  risk_weight: 0.10
+  holder_distribution_weight: 0.10
+  wallet_activity_weight: 0.05

@@ -1,0 +1,84 @@
+# ============================================================
+#  STRATEGY C — SECOND WAVE (6h–5 days)
+#  Targets tokens that pumped, consolidated, and are re-accumulating.
+#  Requires evidence of a previous pump and reaccumulation pattern.
+# ============================================================
+
+enabled: true
+label: "🌊 SECOND WAVE"
+description: "Post-pump reaccumulation, 6h–5 days old"
+
+# ── Age window ───────────────────────────────────────────────
+age:
+  min_hours: 6
+  max_days: 5
+
+# ── Market cap ───────────────────────────────────────────────
+market_cap:
+  min_usd: 100000
+  max_usd: 5000000
+
+# ── Liquidity ────────────────────────────────────────────────
+liquidity:
+  min_usd: 40000
+  require_lp_locked: true
+  liq_to_mc_min_pct: 5
+
+# ── Volume ───────────────────────────────────────────────────
+volume:
+  min_1h_usd: 50000
+  min_24h_usd: 300000
+
+# ── Transactions ─────────────────────────────────────────────
+transactions:
+  min_1h: 400
+
+# ── Buy/Sell pressure ────────────────────────────────────────
+pressure:
+  min_buy_sell_ratio: 1.1
+
+# ── Holders ──────────────────────────────────────────────────
+holders:
+  min_count: 400
+  max_top_holder_pct: 15
+  max_dev_wallet_pct: 8
+
+# ── Security ─────────────────────────────────────────────────
+security:
+  require_mint_renounced: true
+  require_freeze_renounced: true
+  allow_mutable_metadata: false
+  max_rugcheck_score: 500
+
+# ── Second wave detection ─────────────────────────────────────
+second_wave:
+  min_previous_pump_x: 2.0         # must have pumped at least 2x from launch
+  max_drawdown_from_peak_pct: 60   # how far it dropped from peak
+  consolidation_range_pct: 25      # price range during consolidation
+  min_volume_1h_usd: 50000
+  reaccumulation_required: true    # must show buy pressure increasing
+
+# ── Reaccumulation detection ──────────────────────────────────
+reaccumulation:
+  min_buy_sell_ratio_1h: 1.1
+  min_volume_increase_pct: 20      # vs 24h average
+  min_wallet_count_increase: 15    # new wallets entering
+  consolidation_candles: 4         # number of narrow-range candles
+
+# ── Pullback entry ───────────────────────────────────────────
+pullback:
+  enabled: true
+  min_pct: 15
+  max_pct: 35
+  min_5m_vol_usd: 8000
+  watch_window_hours: 48
+
+# ── Scoring overrides ─────────────────────────────────────────
+scoring:
+  min_score: 62
+  momentum_weight: 0.20
+  liquidity_weight: 0.20
+  holder_distribution_weight: 0.20
+  volume_weight: 0.20
+  risk_weight: 0.12
+  wallet_activity_weight: 0.08

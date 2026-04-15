@@ -1,0 +1,80 @@
+# ============================================================
+#  STRATEGY A — SAFE (RAYDIUM / BONDED)
+#  Targets established tokens with proven liquidity.
+#  Strictest security requirements. Best for lower risk entries.
+# ============================================================
+
+enabled: true
+label: "🛡️ SAFE"
+description: "Raydium/bonded tokens with proven liquidity"
+
+# ── Age window ───────────────────────────────────────────────
+age:
+  min_hours: 6
+  max_hours: 72
+
+# ── Market cap ───────────────────────────────────────────────
+market_cap:
+  min_usd: 150000
+  max_usd: 3000000
+
+# ── Liquidity ────────────────────────────────────────────────
+liquidity:
+  min_usd: 50000
+  require_lp_locked: true
+  min_lp_locked_pct: 80
+  liq_to_mc_min_pct: 8
+  liq_to_mc_max_pct: 40
+
+# ── Volume ───────────────────────────────────────────────────
+volume:
+  min_5m_usd: 15000
+  min_1h_usd: 80000
+  min_24h_usd: 500000
+
+# ── Transactions ─────────────────────────────────────────────
+transactions:
+  min_5m: 120
+  min_1h: 800
+
+# ── Buy/Sell pressure ────────────────────────────────────────
+pressure:
+  min_buy_sell_ratio: 1.2     # buys / sells
+  strong_buy_sell_ratio: 1.5  # label as strong signal
+
+# ── Holders ──────────────────────────────────────────────────
+holders:
+  min_count: 300
+  max_top_holder_pct: 15
+  max_dev_wallet_pct: 8
+  max_block0_snipe_pct: 20
+
+# ── Security ─────────────────────────────────────────────────
+security:
+  require_mint_renounced: true
+  require_freeze_renounced: true
+  allow_mutable_metadata: false
+  max_rugcheck_score: 500
+
+# ── Drawdown filter ──────────────────────────────────────────
+drawdown:
+  max_from_peak_pct: 40       # reject if down >40% from ATH
+
+# ── Pullback entry ───────────────────────────────────────────
+pullback:
+  enabled: true
+  min_pct: 20
+  max_pct: 45
+  min_5m_vol_usd: 5000
+  min_vol_recovery_ratio: 0.6
+  min_txn_recovery_ratio: 0.6
+  require_higher_low: true
+  max_consecutive_red_candles: 4
+  watch_window_hours: 48
+
+# ── Scoring overrides ─────────────────────────────────────────
+scoring:
+  min_score: 65
+  momentum_weight: 0.20    # lower momentum weight for safe
+  liquidity_weight: 0.25   # higher liq weight for safe
+  risk_weight: 0.15        # higher risk weight for safe
